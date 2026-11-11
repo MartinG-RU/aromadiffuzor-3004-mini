@@ -1,0 +1,384 @@
+substitutions:
+  device_name: aromadiffuser
+  mac: !secret diffuser_mac
+  service: 'edfec62e-9910-0bac-5241-d8bda6932a2f'
+  write: '0783b03e-8535-b5a0-7140-a304d2495cba'
+  notify: '0783b03e-8535-b5a0-7140-a304d2495cb8'
+
+esphome:
+  name: ${device_name}
+  friendly_name: Аромадиффузор 3004 Mini
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+api:
+ota:
+  - platform: esphome
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+preferences:
+  flash_write_interval: 5min
+esp32_ble_tracker:
+ble_client:
+  - mac_address: ${mac}
+    id: diffuser
+    on_connect:
+      then:
+        - lambda: 'id(link_up) = true; id(known) = false;'
+        - delay: 3s
+        - ble_client.ble_write:
+            id: diffuser
+            service_uuid: ${service}
+            characteristic_uuid: ${write}
+            value: [0xA5, 0x09, 0x02, 0x01, 0xB1]
+        - delay: 1s
+        - script.execute: query_status
+    on_disconnect:
+      then:
+        - lambda: 'id(link_up) = false; id(known) = false;'
+
+globals:
+  - id: link_up
+    type: bool
+    initial_value: 'false'
+  - id: known
+    type: bool
+    initial_value: 'false'
+  - id: power_state
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: last_status_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: usage_seconds
+    type: double
+    restore_value: yes
+    initial_value: '0'
+
+script:
+  - id: query_status
+    then:
+      - if:
+          condition:
+            lambda: 'return id(link_up);'
+          then:
+            - ble_client.ble_write:
+                id: diffuser
+                service_uuid: ${service}
+                characteristic_uuid: ${write}
+                value: [0xA5, 0x08, 0x03, 0x00, 0x00, 0xB0]
+  - id: send_light
+    mode: restart
+    then:
+      - delay: 200ms
+      - if:
+          condition:
+            lambda: 'return id(link_up);'
+          then:
+            - ble_client.ble_write:
+                id: diffuser
+                service_uuid: ${service}
+                characteristic_uuid: ${write}
+                value: !lambda |-
+                  auto val = id(diffuser_light).remote_values;
+                  uint8_t on = val.is_on() ? 1 : 0;
+                  uint8_t r = (uint8_t) roundf(val.get_red() * 255.0f);
+                  uint8_t g = (uint8_t) roundf(val.get_green() * 255.0f);
+                  uint8_t b = (uint8_t) roundf(val.get_blue() * 255.0f);
+                  // Brightness is selected independently of the RGB slider.
+                  // The dedicated slider sends one of the device's levels 1, 2, 3.
+                  uint8_t brightness = (uint8_t) id(brightness_level).state;
+                  // Never send the device an active color cycle while the light is off.
+                  uint8_t auto_color = (on && id(auto_color_switch).state) ? 1 : 0;
+                  uint8_t sum = (uint8_t)(0xA5 + 0x06 + 0x07 + on + r + g + b + brightness + auto_color);
+                  return {0xA5, 0x06, 0x07, on, r, g, b, brightness, auto_color, sum};
+            - delay: 1s
+            - script.execute: query_status
+          else:
+            - logger.log: 'Подсветка: нет BLE-соединения; команда не отправлена.'
+  # Turn off the color cycle first; the diffuser needs time before light-off.
+  - id: shutdown_light_after_cycle
+    mode: restart
+    then:
+      - switch.turn_off: auto_color_switch
+      # switch.turn_off schedules send_light; cancel that delayed direct-off.
+      - script.stop: send_light
+      - if:
+          condition:
+            lambda: 'return id(link_up);'
+          then:
+            - ble_client.ble_write:
+                id: diffuser
+                service_uuid: ${service}
+                characteristic_uuid: ${write}
+                value: !lambda |-
+                  auto val = id(diffuser_light).remote_values;
+                  uint8_t r = (uint8_t) roundf(val.get_red() * 255.0f);
+                  uint8_t g = (uint8_t) roundf(val.get_green() * 255.0f);
+                  uint8_t b = (uint8_t) roundf(val.get_blue() * 255.0f);
+                  uint8_t brightness = (uint8_t) id(brightness_level).state;
+                  uint8_t sum = (uint8_t)(0xA5 + 0x06 + 0x07 + 1 + r + g + b + brightness);
+                  return {0xA5, 0x06, 0x07, 1, r, g, b, brightness, 0, sum};
+            - delay: 1s
+            - if:
+                condition:
+                  lambda: 'return id(link_up) && !id(diffuser_light).remote_values.is_on() && !id(auto_color_switch).state;'
+                then:
+                  - script.execute: send_light
+          else:
+            - logger.log: 'Подсветка: нет BLE-соединения; команда не отправлена.'
+  - id: send_cycle
+    then:
+      - if:
+          condition:
+            lambda: 'return id(link_up);'
+          then:
+            - ble_client.ble_write:
+                id: diffuser
+                service_uuid: ${service}
+                characteristic_uuid: ${write}
+                value: !lambda |-
+                  uint16_t run = (uint16_t) id(run_time).state;
+                  uint16_t pause = (uint16_t) id(pause_time).state;
+                  uint8_t rh = run >> 8, rl = run & 255, ph = pause >> 8, pl = pause & 255;
+                  uint8_t sum = (uint8_t)(0xA5 + 0x07 + 0x09 + 1 + rh + rl + ph + pl);
+                  return {0xA5, 0x07, 0x09, 1, rh, rl, ph, pl, 0, 0, 0, sum};
+            - delay: 1s
+            - script.execute: query_status
+          else:
+            - logger.log: 'Цикл распыления: нет BLE-соединения; команда не отправлена.'
+
+switch:
+  - platform: template
+    id: power_switch
+    name: Питание диффузора
+    icon: mdi:scent
+    lambda: |-
+      if (!id(known) || !id(link_up)) return {};
+      return id(power_state);
+    turn_on_action:
+      - if:
+          condition:
+            lambda: 'return id(link_up);'
+          then:
+            - lambda: 'id(power_state) = true;'
+            - ble_client.ble_write:
+                id: diffuser
+                service_uuid: ${service}
+                characteristic_uuid: ${write}
+                value: [0xA5, 0x04, 0x03, 0x01, 0x00, 0xAD]
+            - delay: 1s
+            - script.execute: query_status
+          else:
+            - logger.log: 'Питание: нет BLE-соединения; команда включения не отправлена.'
+    turn_off_action:
+      - if:
+          condition:
+            lambda: 'return id(link_up);'
+          then:
+            - lambda: 'id(power_state) = false;'
+            - ble_client.ble_write:
+                id: diffuser
+                service_uuid: ${service}
+                characteristic_uuid: ${write}
+                value: [0xA5, 0x04, 0x03, 0x00, 0x00, 0xAC]
+            - delay: 1s
+            - script.execute: query_status
+          else:
+            - logger.log: 'Питание: нет BLE-соединения; команда выключения не отправлена.'
+  - platform: template
+    id: auto_color_switch
+    name: Автосмена цветов
+    icon: mdi:palette-swatch-variant
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - script.execute: send_light
+    turn_off_action:
+      - script.execute: send_light
+
+# Virtual RGB outputs: the real command is sent by the light's automation.
+output:
+  - platform: template
+    id: out_r
+    type: float
+    write_action:
+      - lambda: '(void) state;'
+  - platform: template
+    id: out_g
+    type: float
+    write_action:
+      - lambda: '(void) state;'
+  - platform: template
+    id: out_b
+    type: float
+    write_action:
+      - lambda: '(void) state;'
+
+light:
+  - platform: rgb
+    id: diffuser_light
+    name: Подсветка RGB
+    red: out_r
+    green: out_g
+    blue: out_b
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_state:
+      - if:
+          condition:
+            lambda: 'return !id(diffuser_light).remote_values.is_on() && id(auto_color_switch).state;'
+          then:
+            - script.execute: shutdown_light_after_cycle
+          else:
+            - script.stop: shutdown_light_after_cycle
+            - script.execute: send_light
+
+number:
+  - platform: template
+    id: brightness_level
+    name: Яркость подсветки
+    icon: mdi:brightness-6
+    min_value: 1
+    max_value: 3
+    step: 1
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 2
+    set_action:
+      - delay: 10ms
+      - script.execute: send_light
+  - platform: template
+    id: refill_hours
+    name: Ресурс заправки
+    icon: mdi:bottle-tonic-outline
+    unit_of_measurement: ч
+    min_value: 0
+    max_value: 10000
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    set_action:
+      - delay: 10ms
+      - component.update: usage_hours
+      - component.update: remaining_hours
+  - platform: template
+    id: run_time
+    name: Распыление Run
+    icon: mdi:spray
+    unit_of_measurement: с
+    min_value: 1
+    max_value: 3600
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+  - platform: template
+    id: pause_time
+    name: Пауза Pause
+    icon: mdi:timer-pause-outline
+    unit_of_measurement: с
+    min_value: 0
+    max_value: 3600
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+
+button:
+  - platform: template
+    name: Применить цикл распыления
+    icon: mdi:check-circle-outline
+    on_press:
+      - script.execute: send_cycle
+  - platform: template
+    name: Сброс после заправки
+    icon: mdi:restart
+    on_press:
+      - lambda: 'id(usage_seconds) = 0;'
+      - component.update: usage_hours
+      - component.update: remaining_hours
+
+sensor:
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: diffuser
+    id: raw_notifications
+    internal: true
+    service_uuid: ${service}
+    characteristic_uuid: ${notify}
+    notify: true
+    update_interval: never
+    lambda: |-
+      ESP_LOGI("diffuser", "BLE notification: %s", format_hex_pretty(x).c_str());
+      if (x.size() >= 18 && x[0] == 0xA6) {
+        // The 3004 Mini reports the power bit as ON even after switching OFF.
+        // Retain the last requested state instead of overwriting it.
+        id(known) = true;
+        id(last_status_ms) = millis();
+      }
+      return NAN;
+  - platform: template
+    id: usage_hours
+    name: Расчётное время Usage
+    icon: mdi:clock-outline
+    unit_of_measurement: ч
+    accuracy_decimals: 2
+    update_interval: 30s
+    lambda: 'return id(usage_seconds) / 3600.0;'
+  - platform: template
+    id: remaining_hours
+    name: Остаток ресурса Remaining
+    icon: mdi:timelapse
+    unit_of_measurement: ч
+    accuracy_decimals: 2
+    update_interval: 30s
+    lambda: |-
+      if (id(refill_hours).state <= 0) return NAN;
+      return std::max(0.0, (double) id(refill_hours).state - id(usage_seconds) / 3600.0);
+
+binary_sensor:
+  - platform: template
+    name: BLE соединение
+    lambda: 'return id(link_up);'
+  - platform: template
+    name: Состояние диффузора известно
+    icon: mdi:sync-circle
+    lambda: 'return id(known) && id(link_up) && (uint32_t)(millis() - id(last_status_ms)) < 90000;'
+  - platform: template
+    name: Жидкость предположительно закончилась
+    device_class: problem
+    lambda: |-
+      if (id(refill_hours).state <= 0) return {};
+      return id(usage_seconds) >= id(refill_hours).state * 3600.0;
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          // Average duty-cycle estimate, not a measurement of the real spray phase.
+          if (id(link_up) && id(known) && id(power_state) &&
+              (uint32_t)(millis() - id(last_status_ms)) < 90000) {
+            const double run = id(run_time).state;
+            const double pause = id(pause_time).state;
+            if (run > 0 && run + pause > 0) id(usage_seconds) += run / (run + pause);
+          }
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(link_up);'
+          then:
+            - script.execute: query_status

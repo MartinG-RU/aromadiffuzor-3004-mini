@@ -1,0 +1,10 @@
+secrets.yaml
+secrets.yml
+.env
+.env.*
+.esphome/
+.pio/
+*.bin
+*.elf
+*.log
+__pycache__/
